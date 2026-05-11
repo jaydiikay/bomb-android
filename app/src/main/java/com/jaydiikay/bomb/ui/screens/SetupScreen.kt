@@ -3,7 +3,9 @@ package com.jaydiikay.bomb.ui.screens
 import android.content.Context
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -15,6 +17,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.navigation.NavController
+import com.jaydiikay.bomb.game.PlayerConfig
 import com.jaydiikay.bomb.ui.GameViewModel
 import com.jaydiikay.bomb.ui.theme.GreenTable
 
@@ -27,8 +30,13 @@ fun SetupScreen(navController: NavController, viewModel: GameViewModel = viewMod
     var playerCount by remember { mutableStateOf(2) }
     val playerNames = remember(playerCount) {
         mutableStateListOf<String>().also { list ->
-            list.add(currentUser) // first player is logged-in user
+            list.add(currentUser)
             repeat(playerCount - 1) { i -> list.add("Player ${i + 2}") }
+        }
+    }
+    val playerBots = remember(playerCount) {
+        mutableStateListOf<Boolean>().also { list ->
+            repeat(playerCount) { list.add(false) }
         }
     }
 
@@ -41,6 +49,7 @@ fun SetupScreen(navController: NavController, viewModel: GameViewModel = viewMod
         Column(
             modifier = Modifier
                 .fillMaxWidth()
+                .verticalScroll(rememberScrollState())
                 .padding(24.dp),
             horizontalAlignment = Alignment.CenterHorizontally,
             verticalArrangement = Arrangement.spacedBy(16.dp)
@@ -77,12 +86,17 @@ fun SetupScreen(navController: NavController, viewModel: GameViewModel = viewMod
                                 selected = playerCount == count,
                                 onClick = {
                                     playerCount = count
-                                    // Resize playerNames
                                     while (playerNames.size < count) {
                                         playerNames.add("Player ${playerNames.size + 1}")
                                     }
                                     while (playerNames.size > count) {
                                         playerNames.removeAt(playerNames.size - 1)
+                                    }
+                                    while (playerBots.size < count) {
+                                        playerBots.add(false)
+                                    }
+                                    while (playerBots.size > count) {
+                                        playerBots.removeAt(playerBots.size - 1)
                                     }
                                 },
                                 label = { Text("$count") }
@@ -92,7 +106,6 @@ fun SetupScreen(navController: NavController, viewModel: GameViewModel = viewMod
 
                     Divider()
 
-                    // Name inputs
                     Text(
                         text = "Player Names",
                         fontSize = 16.sp,
@@ -100,13 +113,52 @@ fun SetupScreen(navController: NavController, viewModel: GameViewModel = viewMod
                     )
 
                     playerNames.forEachIndexed { index, name ->
-                        OutlinedTextField(
-                            value = name,
-                            onValueChange = { playerNames[index] = it },
-                            label = { Text("Player ${index + 1}") },
+                        Row(
                             modifier = Modifier.fillMaxWidth(),
-                            singleLine = true,
-                            enabled = index != 0 // first player name is from login
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            OutlinedTextField(
+                                value = name,
+                                onValueChange = { if (!playerBots[index]) playerNames[index] = it },
+                                label = { Text(if (index == 0) "You" else "Player ${index + 1}") },
+                                modifier = Modifier.weight(1f),
+                                singleLine = true,
+                                // First slot is always human (you); bots have locked name
+                                enabled = index != 0 && !playerBots[index]
+                            )
+
+                            // Bot toggle — disabled for player slot 0 (always human)
+                            if (index != 0) {
+                                val isBot = playerBots[index]
+                                Button(
+                                    onClick = {
+                                        val nowBot = !isBot
+                                        playerBots[index] = nowBot
+                                        if (nowBot) {
+                                            playerNames[index] = "Bot ${index + 1}"
+                                        } else {
+                                            playerNames[index] = "Player ${index + 1}"
+                                        }
+                                    },
+                                    colors = ButtonDefaults.buttonColors(
+                                        containerColor = if (isBot) Color(0xFF388E3C) else Color(0xFF616161)
+                                    ),
+                                    contentPadding = PaddingValues(horizontal = 12.dp, vertical = 8.dp)
+                                ) {
+                                    Text("🤖", fontSize = 16.sp)
+                                }
+                            }
+                        }
+                    }
+
+                    // Validation: at least one human player
+                    val hasHuman = playerBots.any { !it }
+                    if (!hasHuman) {
+                        Text(
+                            text = "At least one human player required",
+                            color = Color(0xFFD32F2F),
+                            fontSize = 13.sp
                         )
                     }
 
@@ -114,12 +166,19 @@ fun SetupScreen(navController: NavController, viewModel: GameViewModel = viewMod
 
                     Button(
                         onClick = {
-                            val names = playerNames.map { it.ifBlank { "Player" } }
-                            viewModel.startGame(names)
+                            if (!hasHuman) return@Button
+                            val configs = playerNames.mapIndexed { i, n ->
+                                PlayerConfig(
+                                    name = n.ifBlank { if (playerBots[i]) "Bot ${i + 1}" else "Player ${i + 1}" },
+                                    isBot = playerBots[i]
+                                )
+                            }
+                            viewModel.startGame(configs)
                             navController.navigate("game") {
                                 popUpTo("setup") { inclusive = false }
                             }
                         },
+                        enabled = hasHuman,
                         modifier = Modifier.fillMaxWidth(),
                         colors = ButtonDefaults.buttonColors(containerColor = GreenTable)
                     ) {

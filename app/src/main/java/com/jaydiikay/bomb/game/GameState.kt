@@ -1,14 +1,15 @@
 package com.jaydiikay.bomb.game
 
-import com.jaydiikay.bomb.game.Deck.shuffled
+data class PlayerConfig(val name: String, val isBot: Boolean = false)
 
 data class Player(
     val id: Int,
     val name: String,
-    val hand: MutableList<Card> = mutableListOf()
+    val hand: MutableList<Card> = mutableListOf(),
+    val isBot: Boolean = false
 )
 
-enum class GamePhase { PLAYING, AWAITING_SECOND, BOMB, GAME_OVER }
+enum class GamePhase { PASS_AND_PLAY, PLAYING, AWAITING_SECOND, DREW_CARD, BOMB, GAME_OVER }
 enum class EndReason { NORMAL, BOMB }
 
 data class PlayerScore(
@@ -27,8 +28,10 @@ data class GameState(
     val direction: Int = 1,        // 1 = anti-clockwise (index+1), -1 = clockwise (index-1)
     val reverseOnce: Boolean = false,
     val pendingDraw: Int = 0,
-    val phase: GamePhase = GamePhase.PLAYING,
+    val phase: GamePhase = GamePhase.PASS_AND_PLAY,
     val selectedCard: Card? = null,
+    val isChained: Boolean = false,
+    val drawnCards: List<Card> = emptyList(),
     val endReason: EndReason? = null,
     val scores: List<PlayerScore> = emptyList(),
     val winnerIndex: Int? = null
@@ -40,14 +43,13 @@ object GameLogic {
     // Game creation
     // -----------------------------------------------------------------------
 
-    fun createGame(playerNames: List<String>): GameState {
+    fun createGame(players: List<PlayerConfig>): GameState {
         val deck = Deck.create().toMutableList().also { it.shuffle() }
 
-        // Deal 7 cards to each player
-        val players = playerNames.mapIndexed { i, name ->
+        val gamePlayers = players.mapIndexed { i, config ->
             val hand = mutableListOf<Card>()
             repeat(7) { hand.add(deck.removeFirst()) }
-            Player(i, name, hand)
+            Player(i, config.name, hand, config.isBot)
         }
 
         // Ensure starting card is not special
@@ -58,12 +60,32 @@ object GameLogic {
             topCard.rank in listOf(Rank.TWO, Rank.FOUR, Rank.EIGHT, Rank.JACK) || topCard.isBomb
         )
 
+        // topCard is placed as the initial discard; the pile tracks all played cards
         val discardPile = mutableListOf(topCard)
+        val firstPhase = if (gamePlayers[0].isBot) GamePhase.PLAYING else GamePhase.PASS_AND_PLAY
         return GameState(
-            players = players,
+            players = gamePlayers,
             drawPile = deck,
             discardPile = discardPile,
-            topCard = topCard
+            topCard = topCard,
+            phase = firstPhase
+        )
+    }
+
+    // -----------------------------------------------------------------------
+    // Advance turn helper
+    // -----------------------------------------------------------------------
+
+    private fun advanceTurn(state: GameState): GameState {
+        val n = state.players.size
+        val dir = if (state.reverseOnce) -state.direction else state.direction
+        val nextIdx = ((state.currentPlayerIndex + dir) % n + n) % n
+        val nextPhase = if (state.players[nextIdx].isBot) GamePhase.PLAYING else GamePhase.PASS_AND_PLAY
+        return state.copy(
+            currentPlayerIndex = nextIdx,
+            reverseOnce = false,
+            phase = nextPhase,
+            drawnCards = emptyList()
         )
     }
 
@@ -75,186 +97,179 @@ object GameLogic {
         if (state.phase != GamePhase.PLAYING) return state
 
         val currentPlayer = state.players[state.currentPlayerIndex]
-
-        // Validate the play
         if (!Rules.canPlay(card, state.topCard, state.pendingDraw)) return state
         if (!currentPlayer.hand.any { it.id == card.id }) return state
 
-        // Remove card from hand
         val newHand = currentPlayer.hand.toMutableList()
         newHand.removeIf { it.id == card.id }
         val updatedPlayer = currentPlayer.copy(hand = newHand)
         val newPlayers = state.players.toMutableList()
         newPlayers[state.currentPlayerIndex] = updatedPlayer
 
-        // Add card to discard pile
+        // Add played card to discard pile; it also becomes topCard
         val newDiscard = state.discardPile.toMutableList()
         newDiscard.add(card)
 
-        // Check for bomb
+        var newState = state.copy(
+            players = newPlayers,
+            discardPile = newDiscard,
+            topCard = card
+        )
+
+        // Check for bomb (7 of hearts)
         if (card.isBomb) {
-            // Check if it is the last card (hand now empty)
-            val isLastCard = newHand.isEmpty()
-            val endReason = EndReason.BOMB
-            val winnerIdx = if (isLastCard) state.currentPlayerIndex else null
-            val scores = calculateScores(
-                state.copy(players = newPlayers, discardPile = newDiscard, topCard = card),
-                endReason,
-                winnerIdx
-            )
-            return state.copy(
-                players = newPlayers,
-                discardPile = newDiscard,
-                topCard = card,
-                phase = GamePhase.BOMB,
-                endReason = endReason,
-                scores = scores,
-                winnerIndex = winnerIdx
-            )
+            return handleBombEnd(newState, state.currentPlayerIndex)
         }
 
-        // Check for normal win (hand empty)
+        // Check for normal win (hand empty) — before special card handling so 8/J as last card wins
         if (newHand.isEmpty()) {
-            val scores = calculateScores(
-                state.copy(players = newPlayers, discardPile = newDiscard, topCard = card),
-                EndReason.NORMAL,
-                state.currentPlayerIndex
-            )
-            return state.copy(
-                players = newPlayers,
-                discardPile = newDiscard,
-                topCard = card,
-                phase = GamePhase.GAME_OVER,
-                endReason = EndReason.NORMAL,
-                scores = scores,
-                winnerIndex = state.currentPlayerIndex
-            )
+            return handleNormalWin(newState, state.currentPlayerIndex)
         }
 
         // Apply card effects
-        var newPendingDraw = state.pendingDraw
-        var newDirection = state.direction
-        var newReverseOnce = state.reverseOnce
-        var newPhase = GamePhase.PLAYING
-
         when (card.rank) {
             Rank.TWO -> {
-                newPendingDraw += 2
+                // Neutralize a pending draw-2 penalty; fresh 2 forces next player to draw 2
+                val newPending = if (state.pendingDraw > 0) 0 else 2
+                newState = newState.copy(pendingDraw = newPending)
+                return advanceTurn(newState)
             }
             Rank.FOUR -> {
-                // Reverse direction for one turn
-                if (state.players.size == 2) {
-                    // With 2 players: current player goes again (skip next)
-                    newReverseOnce = true
+                return if (state.players.size == 2) {
+                    // With 2 players, reversal returns play to the same person
+                    newState.copy(
+                        pendingDraw = 0,
+                        phase = if (currentPlayer.isBot) GamePhase.PLAYING else GamePhase.PASS_AND_PLAY
+                    )
                 } else {
-                    newReverseOnce = true
+                    newState = newState.copy(reverseOnce = true, pendingDraw = 0)
+                    advanceTurn(newState)
                 }
             }
             Rank.EIGHT, Rank.JACK -> {
-                // Requires a second card
-                val validSeconds = Rules.validSecondCards(card, newHand)
-                if (validSeconds.isEmpty()) {
-                    // Must draw if no valid second card
-                    val withDraw = drawCardForCurrentPlayer(
-                        state.copy(
-                            players = newPlayers,
-                            discardPile = newDiscard,
-                            topCard = card
-                        )
-                    )
-                    val nextIdx = nextTurn(withDraw)
-                    return withDraw.copy(currentPlayerIndex = nextIdx, phase = GamePhase.PLAYING)
-                } else {
-                    newPhase = GamePhase.AWAITING_SECOND
-                    return state.copy(
-                        players = newPlayers,
-                        discardPile = newDiscard,
-                        topCard = card,
-                        phase = GamePhase.AWAITING_SECOND,
-                        selectedCard = card,
-                        pendingDraw = newPendingDraw,
-                        direction = newDirection,
-                        reverseOnce = newReverseOnce
-                    )
-                }
+                // Always enter AWAITING_SECOND — player can cancel if no valid second card
+                return newState.copy(
+                    phase = GamePhase.AWAITING_SECOND,
+                    selectedCard = card,
+                    isChained = false,
+                    pendingDraw = 0
+                )
             }
-            else -> { /* no special effect */ }
+            else -> {}
         }
 
-        // Advance turn
-        val tempState = state.copy(
-            players = newPlayers,
-            discardPile = newDiscard,
-            topCard = card,
-            pendingDraw = newPendingDraw,
-            direction = newDirection,
-            reverseOnce = newReverseOnce,
-            phase = newPhase
-        )
-        val nextIdx = nextTurn(tempState)
-        var finalState = tempState.copy(currentPlayerIndex = nextIdx)
-
-        // If next player has a pendingDraw and cannot stack, they auto-draw
-        // (handled in drawCard call from UI)
-        return finalState
+        newState = newState.copy(pendingDraw = 0)
+        return advanceTurn(newState)
     }
 
     // -----------------------------------------------------------------------
-    // Play a pair (for 8 / J)
+    // Play a pair (8/J + second card)
     // -----------------------------------------------------------------------
 
-    fun playPair(state: GameState, first: Card, second: Card): GameState {
+    fun playPair(state: GameState, second: Card): GameState {
         if (state.phase != GamePhase.AWAITING_SECOND) return state
+        val first = state.selectedCard ?: return state
 
         val currentPlayer = state.players[state.currentPlayerIndex]
+        if (!Rules.validSecondCards(first, currentPlayer.hand).any { it.id == second.id }) return state
 
-        // Validate second card
-        if (!Rules.validSecondCards(first, currentPlayer.hand).any { it.id == second.id }) {
-            return state
-        }
-
-        // Remove second card from hand
         val newHand = currentPlayer.hand.toMutableList()
         newHand.removeIf { it.id == second.id }
         val updatedPlayer = currentPlayer.copy(hand = newHand)
         val newPlayers = state.players.toMutableList()
         newPlayers[state.currentPlayerIndex] = updatedPlayer
 
-        // Add second card to discard pile
         val newDiscard = state.discardPile.toMutableList()
         newDiscard.add(second)
 
-        // Check for normal win
-        if (newHand.isEmpty()) {
-            val scores = calculateScores(
-                state.copy(players = newPlayers, discardPile = newDiscard, topCard = second),
-                EndReason.NORMAL,
-                state.currentPlayerIndex
-            )
-            return state.copy(
-                players = newPlayers,
-                discardPile = newDiscard,
-                topCard = second,
-                phase = GamePhase.GAME_OVER,
-                endReason = EndReason.NORMAL,
-                scores = scores,
-                winnerIndex = state.currentPlayerIndex
-            )
-        }
-
-        val tempState = state.copy(
+        var newState = state.copy(
             players = newPlayers,
             discardPile = newDiscard,
             topCard = second,
-            phase = GamePhase.PLAYING,
-            selectedCard = null
+            selectedCard = null,
+            isChained = false,
+            pendingDraw = 0
         )
-        val nextIdx = nextTurn(tempState)
-        return tempState.copy(currentPlayerIndex = nextIdx)
+
+        // Check for bomb as second card
+        if (second.isBomb) {
+            return handleBombEnd(newState, state.currentPlayerIndex)
+        }
+
+        // Check win
+        if (newHand.isEmpty()) {
+            return handleNormalWin(newState, state.currentPlayerIndex)
+        }
+
+        // If second card is also 8/J, chain — player must play another second card
+        if (Rules.requiresSecondCard(second)) {
+            return newState.copy(
+                phase = GamePhase.AWAITING_SECOND,
+                selectedCard = second,
+                isChained = true
+            )
+        }
+
+        // Apply special effects of the second card
+        when (second.rank) {
+            Rank.FOUR -> {
+                return if (state.players.size == 2) {
+                    newState.copy(
+                        phase = if (currentPlayer.isBot) GamePhase.PLAYING else GamePhase.PASS_AND_PLAY
+                    )
+                } else {
+                    newState = newState.copy(reverseOnce = true)
+                    advanceTurn(newState)
+                }
+            }
+            Rank.TWO -> {
+                newState = newState.copy(pendingDraw = state.pendingDraw + 2)
+                return advanceTurn(newState)
+            }
+            else -> {}
+        }
+
+        return advanceTurn(newState)
     }
 
     // -----------------------------------------------------------------------
-    // Draw a card (player action)
+    // Cancel second card selection — draws 1 card and pauses
+    // -----------------------------------------------------------------------
+
+    fun cancelSecond(state: GameState): GameState {
+        if (state.selectedCard == null) return state
+        val currentPlayer = state.players[state.currentPlayerIndex]
+
+        // If hand is already empty, win immediately
+        if (currentPlayer.hand.isEmpty()) {
+            return handleNormalWin(
+                state.copy(selectedCard = null, isChained = false),
+                state.currentPlayerIndex
+            )
+        }
+
+        val handBefore = currentPlayer.hand.map { it.id }.toSet()
+        var workingState = ensureDrawPile(state)
+        val newHand = currentPlayer.hand.toMutableList()
+        if (workingState.drawPile.isNotEmpty()) {
+            newHand.add(workingState.drawPile.removeFirst())
+        }
+        val updatedPlayer = currentPlayer.copy(hand = newHand)
+        val newPlayers = workingState.players.toMutableList()
+        newPlayers[workingState.currentPlayerIndex] = updatedPlayer
+        val drawnCards = newHand.filter { it.id !in handBefore }
+
+        return workingState.copy(
+            players = newPlayers,
+            selectedCard = null,
+            isChained = false,
+            drawnCards = drawnCards,
+            phase = GamePhase.DREW_CARD
+        )
+    }
+
+    // -----------------------------------------------------------------------
+    // Draw a card (player action) — pauses at DREW_CARD
     // -----------------------------------------------------------------------
 
     fun drawCard(state: GameState): GameState {
@@ -262,10 +277,10 @@ object GameLogic {
 
         val currentPlayer = state.players[state.currentPlayerIndex]
         val drawCount = if (state.pendingDraw > 0) state.pendingDraw else 1
+        val handBefore = currentPlayer.hand.map { it.id }.toSet()
 
         var workingState = state
         val newHand = currentPlayer.hand.toMutableList()
-
         repeat(drawCount) {
             workingState = ensureDrawPile(workingState)
             if (workingState.drawPile.isNotEmpty()) {
@@ -276,119 +291,152 @@ object GameLogic {
         val updatedPlayer = currentPlayer.copy(hand = newHand)
         val newPlayers = workingState.players.toMutableList()
         newPlayers[workingState.currentPlayerIndex] = updatedPlayer
+        val drawnCards = newHand.filter { it.id !in handBefore }
 
-        val tempState = workingState.copy(
+        return workingState.copy(
             players = newPlayers,
             pendingDraw = 0,
-            phase = GamePhase.PLAYING
+            drawnCards = drawnCards,
+            phase = GamePhase.DREW_CARD
         )
-        val nextIdx = nextTurn(tempState)
-        return tempState.copy(currentPlayerIndex = nextIdx)
     }
 
     // -----------------------------------------------------------------------
-    // Internal: draw cards for current player without advancing turn
+    // End the drew-card pause and advance turn
     // -----------------------------------------------------------------------
 
-    private fun drawCardForCurrentPlayer(state: GameState): GameState {
-        val currentPlayer = state.players[state.currentPlayerIndex]
-        var workingState = ensureDrawPile(state)
-        val newHand = currentPlayer.hand.toMutableList()
-        if (workingState.drawPile.isNotEmpty()) {
-            newHand.add(workingState.drawPile.removeFirst())
-        }
-        val updatedPlayer = currentPlayer.copy(hand = newHand)
-        val newPlayers = workingState.players.toMutableList()
-        newPlayers[workingState.currentPlayerIndex] = updatedPlayer
-        return workingState.copy(players = newPlayers)
+    fun endDrawnTurn(state: GameState): GameState {
+        return advanceTurn(state.copy(drawnCards = emptyList()))
     }
 
     // -----------------------------------------------------------------------
-    // Compute next player index
+    // Compute next player index (exposed for ViewModel if needed)
     // -----------------------------------------------------------------------
 
     fun nextTurn(state: GameState): Int {
         val n = state.players.size
-        return if (state.reverseOnce) {
-            // For card 4: one turn clockwise (index - 1), then back to anti-clockwise
-            // The reverseOnce flag is consumed here
-            val clockwiseNext = ((state.currentPlayerIndex - 1) + n) % n
-            clockwiseNext
+        val dir = if (state.reverseOnce) -state.direction else state.direction
+        return ((state.currentPlayerIndex + dir) % n + n) % n
+    }
+
+    // -----------------------------------------------------------------------
+    // Bomb ending
+    // -----------------------------------------------------------------------
+
+    private fun handleBombEnd(state: GameState, triggeringIndex: Int): GameState {
+        val scores = state.players.map { Scoring.scoreHand(it.hand) }
+        val bombWasLastCard = state.players[triggeringIndex].hand.isEmpty()
+
+        val playerScores = if (bombWasLastCard) {
+            val otherScores = scores.filterIndexed { i, _ -> i != triggeringIndex }
+            val maxOther = if (otherScores.isNotEmpty()) otherScores.max() else 0
+            state.players.mapIndexed { i, player ->
+                PlayerScore(
+                    player = player,
+                    score = scores[i],
+                    isWinner = i == triggeringIndex,
+                    isLoser = i != triggeringIndex && scores[i] == maxOther
+                )
+            }
         } else {
-            // Anti-clockwise: index + 1
-            (state.currentPlayerIndex + 1) % n
-        }
-    }
-
-    // After direction reversal is applied, clear the flag
-    fun consumeReverseOnce(state: GameState): GameState {
-        return if (state.reverseOnce) state.copy(reverseOnce = false) else state
-    }
-
-    // -----------------------------------------------------------------------
-    // Scoring
-    // -----------------------------------------------------------------------
-
-    private fun calculateScores(
-        state: GameState,
-        endReason: EndReason,
-        winnerIndex: Int?
-    ): List<PlayerScore> {
-        val scores = state.players.map { player ->
-            Scoring.scoreHand(player.hand)
-        }
-
-        return when (endReason) {
-            EndReason.NORMAL -> {
-                // Normal win: first to empty hand wins; highest scorer loses
-                val maxScore = scores.max()
-                state.players.mapIndexed { i, player ->
-                    val isWinner = i == winnerIndex
-                    val isLoser = !isWinner && scores[i] == maxScore &&
-                            scores.count { it == maxScore } == 1 ||
-                            (!isWinner && scores[i] == maxScore)
-                    PlayerScore(
-                        player = player,
-                        score = scores[i],
-                        isWinner = isWinner,
-                        isLoser = !isWinner && scores[i] == maxScore
-                    )
-                }
-            }
-            EndReason.BOMB -> {
-                if (winnerIndex != null) {
-                    // Bomb as last card: that player wins; highest scorer among rest loses
-                    val otherScores = scores.filterIndexed { i, _ -> i != winnerIndex }
-                    val maxOtherScore = if (otherScores.isNotEmpty()) otherScores.max() else 0
-                    state.players.mapIndexed { i, player ->
-                        val isWinner = i == winnerIndex
-                        val isLoser = !isWinner && scores[i] == maxOtherScore
-                        PlayerScore(
-                            player = player,
-                            score = scores[i],
-                            isWinner = isWinner,
-                            isLoser = isLoser
-                        )
-                    }
-                } else {
-                    // Bomb mid-game: lowest scorer wins, highest loses
-                    val minScore = scores.min()
-                    val maxScore = scores.max()
-                    state.players.mapIndexed { i, player ->
-                        PlayerScore(
-                            player = player,
-                            score = scores[i],
-                            isWinner = scores[i] == minScore,
-                            isLoser = scores[i] == maxScore
-                        )
-                    }
-                }
+            val minScore = scores.min()
+            val maxScore = scores.max()
+            state.players.mapIndexed { i, player ->
+                PlayerScore(
+                    player = player,
+                    score = scores[i],
+                    isWinner = scores[i] == minScore,
+                    isLoser = scores[i] == maxScore
+                )
             }
         }
+
+        val winnerIdx = if (bombWasLastCard) triggeringIndex
+        else playerScores.indexOfFirst { it.isWinner }
+
+        return state.copy(
+            phase = GamePhase.BOMB,
+            endReason = EndReason.BOMB,
+            scores = playerScores,
+            winnerIndex = winnerIdx
+        )
     }
 
     // -----------------------------------------------------------------------
-    // Recycle discard pile into draw pile
+    // Normal win — tiebreaker: tied highest scorers each draw until unique loser
+    // -----------------------------------------------------------------------
+
+    private fun handleNormalWin(state: GameState, winnerIndex: Int): GameState {
+        val scores = state.players.map { Scoring.scoreHand(it.hand) }.toMutableList()
+        var workingState = state
+
+        val otherIndices = state.players.indices.filter { it != winnerIndex }
+        val otherScores = otherIndices.associateWith { scores[it] }.toMutableMap()
+
+        while (true) {
+            if (otherScores.isEmpty()) break
+            val maxScore = otherScores.values.max()
+            val tied = otherScores.filter { it.value == maxScore }
+
+            if (tied.size == 1) {
+                val loserIdx = tied.keys.first()
+                return workingState.copy(
+                    phase = GamePhase.GAME_OVER,
+                    endReason = EndReason.NORMAL,
+                    scores = buildScores(state.players, scores, winnerIndex, loserIdx),
+                    winnerIndex = winnerIndex
+                )
+            }
+
+            // Tied — each tied player draws a card to break the tie
+            var exhausted = false
+            for (idx in tied.keys) {
+                workingState = ensureDrawPile(workingState)
+                if (workingState.drawPile.isEmpty()) { exhausted = true; break }
+                val card = workingState.drawPile.removeFirst()
+                val added = Scoring.scoreHand(listOf(card))
+                scores[idx] += added
+                otherScores[idx] = scores[idx]
+            }
+
+            if (exhausted) {
+                val maxScore2 = otherScores.values.max()
+                val loserIdx = otherScores.filter { it.value == maxScore2 }.keys.first()
+                return workingState.copy(
+                    phase = GamePhase.GAME_OVER,
+                    endReason = EndReason.NORMAL,
+                    scores = buildScores(state.players, scores, winnerIndex, loserIdx),
+                    winnerIndex = winnerIndex
+                )
+            }
+        }
+
+        // Fallback (single other player)
+        val loserIdx = otherIndices.firstOrNull() ?: winnerIndex
+        return workingState.copy(
+            phase = GamePhase.GAME_OVER,
+            endReason = EndReason.NORMAL,
+            scores = buildScores(state.players, scores, winnerIndex, loserIdx),
+            winnerIndex = winnerIndex
+        )
+    }
+
+    private fun buildScores(
+        players: List<Player>,
+        scores: List<Int>,
+        winnerIndex: Int,
+        loserIndex: Int
+    ): List<PlayerScore> = players.mapIndexed { i, player ->
+        PlayerScore(
+            player = player,
+            score = scores[i],
+            isWinner = i == winnerIndex,
+            isLoser = i == loserIndex
+        )
+    }
+
+    // -----------------------------------------------------------------------
+    // Deck recycling
     // -----------------------------------------------------------------------
 
     private fun recycleDeck(state: GameState): GameState {
@@ -397,8 +445,7 @@ object GameLogic {
         val toShuffle = state.discardPile.dropLast(1).toMutableList()
         toShuffle.shuffle()
         val newDrawPile = (state.drawPile + toShuffle).toMutableList()
-        val newDiscard = mutableListOf(top)
-        return state.copy(drawPile = newDrawPile, discardPile = newDiscard)
+        return state.copy(drawPile = newDrawPile, discardPile = mutableListOf(top))
     }
 
     private fun ensureDrawPile(state: GameState): GameState {
